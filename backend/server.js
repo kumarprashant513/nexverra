@@ -13,11 +13,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // --- Configuration ---
 const FRONTEND_DOMAINS = [
-  "https://nexverra.in", "https://localhost:3000",
+  "https://nexverra.in", "https://localhost:10000",
   "https://nexverra-website-1-t740.onrender.com"
 ];
 
