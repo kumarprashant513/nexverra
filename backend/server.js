@@ -31,7 +31,7 @@ app.use(express.json({ limit: '10mb' }));
 
 
 // --- MongoDB Connection ---
-const MONGO_URI = process.env.MONGO_URI  || 'mongodb://127.0.0.1:27017/nexverra-website' || 'mongodb+srv://nexverra_db_user:8HnzQCgFqlPuzq50@cluster.jesf1md.mongodb.net/?retryWrites=true&w=majority&appName=Cluster' || 'mongodb://127.0.0.1:27017/nexverra-website';
+const MONGO_URI = process.env.MONGO_URI  || 'mongodb+srv://nexverra_db_user:8HnzQCgFqlPuzq50@cluster.jesf1md.mongodb.net/?retryWrites=true&w=majority&appName=Cluster';
 
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-default-jwt-secret';
