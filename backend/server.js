@@ -1,3 +1,4 @@
+
 // server.js
 import express from 'express';
 import cors from 'cors';
@@ -47,6 +48,7 @@ const productSchema = new mongoose.Schema({
     fileName: String,
     fileData: String, // Base64 encoded ZIP
   },
+  databaseLink: { type: String, default: null },
 });
 const Product = mongoose.model('Product', productSchema);
 
@@ -91,9 +93,20 @@ const orderSchema = new mongoose.Schema({
         fileName: String,
         fileData: String, // Base64 encoded ZIP
     },
-    timeline: [timelineEventSchema]
+    isProductOrder: { type: Boolean, default: false },
+    products: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
+    timeline: [timelineEventSchema],
+    databaseLink: { type: String, default: null },
 }, { timestamps: true });
 const Order = mongoose.model('Order', orderSchema);
+
+const chatMessageSchema = new mongoose.Schema({
+    sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    receiver: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // For admin-customer chat, receiver is usually 'admin' or specific user
+    text: { type: String, required: true },
+    isRead: { type: Boolean, default: false },
+}, { timestamps: true });
+const ChatMessage = mongoose.model('ChatMessage', chatMessageSchema);
 
 
 // --- Data Transformation ---
@@ -158,6 +171,22 @@ const constructUserPayload = (user) => {
         isActive: user.isActive,
         createdAt: user.createdAt.toISOString(),
     };
+};
+
+const sendAdminChatNotification = async (senderId, messageText) => {
+    try {
+        const primaryAdmin = await User.findOne({ role: 'admin' });
+        if (primaryAdmin) {
+            const autoMessage = new ChatMessage({
+                sender: senderId,
+                receiver: primaryAdmin._id,
+                text: messageText
+            });
+            await autoMessage.save();
+        }
+    } catch (error) {
+        console.error("Admin chat notification failed:", error);
+    }
 };
 
 // --- Initial Data Seeding ---
@@ -563,6 +592,7 @@ app.post('/api/orders', async (req, res) => {
                     email: userInfo.email.toLowerCase(),
                     username: userInfo.email.toLowerCase(),
                     password: hashedPassword,
+                    contact: userInfo.contact || userInfo.phone, 
                     role: 'customer',
                     hasTemporaryPassword: true,
                 });
@@ -597,6 +627,8 @@ app.post('/api/orders', async (req, res) => {
                 planPrice: totalPrice,
                 details: details,
                 status: 'Delivered',
+                isProductOrder: true,
+                products: products.map(p => p._id),
                 timeline: [
                     { status: 'Pending', description: 'Order has been placed.' },
                     { status: 'Processing', description: 'Processing digital product.' },
@@ -613,6 +645,7 @@ app.post('/api/orders', async (req, res) => {
                 planPrice: order.planPrice,
                 details: order.details,
                 status: 'Pending',
+                isProductOrder: false,
                 timeline: [{ status: 'Pending', description: statusDescriptions['Pending'] }]
             };
         } else {
@@ -621,6 +654,21 @@ app.post('/api/orders', async (req, res) => {
 
         const newOrder = new Order(newOrderData);
         const savedOrder = await newOrder.save();
+
+        const orderItemsSummary = order.productIds ? 
+            (await Product.find({ _id: { $in: order.productIds } })).map(p => p.title).join(', ') : 
+            order.planTitle;
+
+        // Strictly left-aligned template for perfect parsing
+        const orderSummary = `[AUTO_NOTIFICATION:ORDER]
+Full Name: ${userInfo.fullName}
+Email Address: ${userInfo.email}
+Purpose of Contact: ${orderItemsSummary} (Order ID: #${savedOrder.orderId})
+Phone Number: ${userInfo.contact || userInfo.phone || 'N/A'}
+Location / Address: ${userInfo.address || 'N/A'}
+Details / Requirements: Order request with total amount ₹${savedOrder.planPrice}. Status: ${savedOrder.status}.`;
+
+        await sendAdminChatNotification(user._id, orderSummary);
 
         res.status(201).json({
             message: "Order placed successfully.",
@@ -639,6 +687,86 @@ app.post('/api/orders', async (req, res) => {
         }
         console.error('Order placement error:', error);
         res.status(500).json({ message: 'Server error during order placement', error: error.message });
+    }
+});
+
+// New endpoint for Contact Page
+app.post('/api/contact', async (req, res) => {
+    const { userInfo, inquiry } = req.body;
+    
+    if (!userInfo || !userInfo.email || !userInfo.fullName) {
+        return res.status(400).json({ message: 'Missing user information.' });
+    }
+
+    try {
+        let user;
+        let temporaryPassword = null;
+        let responseToken = null;
+        let responseUserPayload = null;
+        
+        // Find or create user
+        user = await User.findOne({ email: userInfo.email.toLowerCase() });
+        if (!user) {
+            temporaryPassword = crypto.randomBytes(8).toString('hex');
+            const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
+            
+            user = await User.create({
+                fullName: userInfo.fullName,
+                email: userInfo.email.toLowerCase(),
+                username: userInfo.email.toLowerCase(),
+                password: hashedPassword,
+                contact: userInfo.phone || userInfo.contact,
+                role: 'customer',
+                hasTemporaryPassword: true,
+            });
+            responseUserPayload = constructUserPayload(user);
+            responseToken = jwt.sign(responseUserPayload, JWT_SECRET, { expiresIn: '24h' });
+        }
+
+        // If a real plan is selected (not 'Other'), create an order
+        const isRealPlan = inquiry.plan && inquiry.plan !== "Other / General Inquiry";
+        let order = null;
+
+        if (isRealPlan) {
+            const newOrderId = await generateOrderId();
+            const newOrder = new Order({
+                orderId: newOrderId,
+                user: user._id,
+                planTitle: inquiry.plan,
+                planPrice: inquiry.planPrice || 0,
+                details: inquiry.message,
+                status: 'Pending',
+                isProductOrder: false,
+                timeline: [{ status: 'Pending', description: 'Order request submitted through contact form.' }]
+            });
+            const savedOrder = await newOrder.save();
+            order = transformOrder(savedOrder);
+        }
+
+        const orderIdSuffix = order ? ` (Order ID: #${order.orderId})` : '';
+        
+        // Strictly left-aligned template for perfect parsing
+        const inquirySummary = `[AUTO_NOTIFICATION:INQUIRY]
+Full Name: ${userInfo.fullName}
+Email Address: ${userInfo.email}
+Purpose of Contact: ${inquiry.plan}${orderIdSuffix}
+Phone Number: ${userInfo.phone || userInfo.contact || 'N/A'}
+Location / Address: ${userInfo.address || 'N/A'}
+Details / Requirements: ${inquiry.message}`;
+
+        await sendAdminChatNotification(user._id, inquirySummary);
+
+        res.status(201).json({
+            message: isRealPlan ? "Order request submitted successfully." : "Inquiry submitted successfully.",
+            user: responseUserPayload || constructUserPayload(user),
+            token: responseToken,
+            temporaryPassword,
+            order
+        });
+
+    } catch (error) {
+        console.error('Contact submission error:', error);
+        res.status(500).json({ message: 'Server error during submission', error: error.message });
     }
 });
 
@@ -742,7 +870,7 @@ app.get('/api/admin/orders', authenticateToken, authenticateAdmin, async (req, r
             ];
         }
 
-        const orders = await Order.find(query).sort({ createdAt: -1 }).populate('user', 'fullName email');
+        const orders = await Order.find(query).sort({ createdAt: -1 }).populate('user', 'fullName email').populate('products');
         res.json(orders.map(transformOrder));
     } catch (error) {
         res.status(500).json({ message: 'Error fetching orders for admin', error: error.message });
@@ -898,6 +1026,394 @@ app.delete('/api/admin/users', authenticateToken, authenticateAdmin, async (req,
         res.status(204).send();
     } catch (error) {
         res.status(500).json({ message: 'Server error bulk deleting users', error: error.message });
+    }
+});
+
+// Admin Database Routes
+app.get('/api/admin/database', authenticateToken, authenticateAdmin, async (req, res) => {
+    try {
+        const { search, itemType } = req.query;
+        
+        let userIds = null;
+        if (search) {
+            const searchRegex = { $regex: search, $options: 'i' };
+            const matchingUsers = await User.find({
+                $or: [{ fullName: searchRegex }, { email: searchRegex }],
+            }).select('_id');
+            userIds = matchingUsers.map(u => u._id);
+            if (userIds.length === 0) {
+                return res.json([]);
+            }
+        }
+        
+        const orderQuery = {};
+        if (userIds) {
+            orderQuery.user = { $in: userIds };
+        }
+        if (itemType === 'product') {
+           orderQuery.isProductOrder = true;
+        } else if (itemType === 'plan') {
+           orderQuery.isProductOrder = false;
+        }
+
+        const orders = await Order.find(orderQuery)
+            .populate('user', 'fullName email')
+            .populate('products', 'title databaseLink')
+            .sort({ createdAt: -1 });
+
+        const usersWithPurchases = new Map();
+
+        for (const order of orders) {
+            if (!order.user) continue;
+
+            const userId = order.user._id.toString();
+            if (!usersWithPurchases.has(userId)) {
+                usersWithPurchases.set(userId, {
+                    userId: userId,
+                    fullName: order.user.fullName,
+                    email: order.user.email,
+                    purchases: [],
+                });
+            }
+
+            const userEntry = usersWithPurchases.get(userId);
+            
+            if (order.isProductOrder) {
+                for (const product of order.products) {
+                    if (product && !userEntry.purchases.some(p => p.itemId === product._id.toString())) {
+                        userEntry.purchases.push({
+                            itemId: product._id.toString(),
+                            itemType: 'product',
+                            title: product.title,
+                            databaseLink: product.databaseLink || '',
+                        });
+                    }
+                }
+            } else { // It's a service plan order
+                if (!userEntry.purchases.some(p => p.itemId === order._id.toString())) {
+                    userEntry.purchases.push({
+                        itemId: order._id.toString(),
+                        itemType: 'plan',
+                        title: order.planTitle,
+                        databaseLink: order.databaseLink || '',
+                    });
+                }
+            }
+        }
+
+        res.json(Array.from(usersWithPurchases.values()));
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching purchased data', error: error.message });
+    }
+});
+
+
+app.put('/api/admin/products/:id/database-link', authenticateToken, authenticateAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { link } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ message: 'Invalid product ID.' });
+    }
+    if (typeof link !== 'string') {
+        return res.status(400).json({ message: 'A valid link must be provided.' });
+    }
+
+    try {
+        await Product.findByIdAndUpdate(id, { databaseLink: link });
+        res.status(200).json({ message: 'Database link updated successfully.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error updating database link', error: error.message });
+    }
+});
+
+app.put('/api/admin/orders/:id/database-link', authenticateToken, authenticateAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { link } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ message: 'Invalid order ID.' });
+    }
+    if (typeof link !== 'string') {
+        return res.status(400).json({ message: 'A valid link must be provided.' });
+    }
+
+    try {
+        await Order.findByIdAndUpdate(id, { databaseLink: link });
+        res.status(200).json({ message: 'Database link updated successfully.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error updating database link', error: error.message });
+    }
+});
+
+
+// User Database Link Route
+app.get('/api/database-link', authenticateToken, async (req, res) => {
+    try {
+        const orders = await Order.find({ user: req.user.id })
+            .populate('products', 'title databaseLink');
+
+        if (!orders || orders.length === 0) {
+            return res.json([]);
+        }
+
+        const links = new Map();
+        orders.forEach(order => {
+            // If the order has populated products, it's a product order.
+            if (order.products && order.products.length > 0) {
+                order.products.forEach(product => {
+                    if (product && product.databaseLink) {
+                        // Use product.id as key to avoid issues with identical links
+                        links.set(product._id.toString(), { 
+                            title: product.title, 
+                            link: product.databaseLink 
+                        });
+                    }
+                });
+            } else { // This is for service plans
+                 if (order.databaseLink) {
+                    // Use order.id as key
+                    links.set(order._id.toString(), {
+                        title: order.planTitle,
+                        link: order.databaseLink
+                    });
+                 }
+            }
+        });
+
+        res.json(Array.from(links.values()));
+    } catch (error) {
+        console.error("Error fetching database links for user:", error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+});
+
+// --- Chat Routes ---
+
+// Admin: Get all conversations
+app.get('/api/admin/chats', authenticateToken, authenticateAdmin, async (req, res) => {
+    try {
+        const admins = await User.find({ role: 'admin' }).select('_id');
+        const adminIds = admins.map(a => a._id);
+
+        // Find users who have exchanged messages with an admin
+        const conversations = await ChatMessage.aggregate([
+            {
+                $match: {
+                    $or: [
+                        { sender: { $in: adminIds } },
+                        { receiver: { $in: adminIds } }
+                    ]
+                }
+            },
+            {
+                $sort: { createdAt: -1 }
+            },
+            {
+                $group: {
+                    _id: {
+                        $cond: [
+                            { $in: ["$sender", adminIds] },
+                            "$receiver",
+                            "$sender"
+                        ]
+                    },
+                    lastMessage: { $first: "$text" },
+                    lastTimestamp: { $first: "$createdAt" },
+                }
+            },
+            {
+                $lookup: {
+                    from: 'users',
+                    localField: '_id',
+                    foreignField: '_id',
+                    as: 'user'
+                }
+            },
+            { $unwind: "$user" },
+            {
+                $project: {
+                    userId: "$_id",
+                    fullName: "$user.fullName",
+                    email: "$user.email",
+                    lastMessage: 1,
+                    lastTimestamp: 1
+                }
+            },
+            { $sort: { lastTimestamp: -1 } }
+        ]);
+
+        // Add unreadCount to each conversation
+        const enrichedConversations = await Promise.all(conversations.map(async (c) => {
+            const unreadCount = await ChatMessage.countDocuments({
+                sender: c.userId,
+                receiver: { $in: adminIds },
+                isRead: false
+            });
+            return {
+                ...c,
+                userId: c.userId.toString(),
+                unreadCount
+            };
+        }));
+
+        res.json(enrichedConversations);
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching chat users', error: error.message });
+    }
+});
+
+// Admin/Customer: Get history with a specific user
+app.get('/api/chats/:targetId', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+        const targetId = req.params.targetId;
+
+        const admins = await User.find({ role: 'admin' }).select('_id');
+        const adminIds = admins.map(a => a._id);
+
+        let actualCustomerUserId;
+
+        if (userRole === 'admin') {
+            // Requester is admin, targetId is the customer ID
+            actualCustomerUserId = targetId;
+        } else {
+            // Requester is customer, targetId is likely 'admin'
+            actualCustomerUserId = userId;
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(actualCustomerUserId)) {
+            return res.status(400).json({ message: 'Invalid customer ID' });
+        }
+
+        // UNIFIED QUERY: All messages where one end is the customer and the other is ANY admin
+        const messages = await ChatMessage.find({
+            $or: [
+                { sender: actualCustomerUserId, receiver: { $in: adminIds } },
+                { sender: { $in: adminIds }, receiver: actualCustomerUserId }
+            ]
+        })
+        .sort({ createdAt: 1 })
+        .populate('sender', 'role');
+
+        res.json(messages.map(m => ({
+            id: m._id.toString(),
+            sender: m.sender._id.toString(),
+            senderRole: m.sender.role,
+            text: m.text,
+            isRead: m.isRead,
+            createdAt: m.createdAt
+        })));
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching messages', error: error.message });
+    }
+});
+
+// Admin/Customer: Mark messages as read
+app.put('/api/chats/:targetId/read', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+        const targetId = req.params.targetId;
+
+        const admins = await User.find({ role: 'admin' }).select('_id');
+        const adminIds = admins.map(a => a._id);
+
+        let query = {};
+
+        if (userRole === 'admin') {
+            // Admin marking customer messages as read
+            query = { sender: targetId, receiver: userId, isRead: false };
+        } else {
+            // Customer marking all admin messages as read
+            query = { sender: { $in: adminIds }, receiver: userId, isRead: false };
+        }
+
+        await ChatMessage.updateMany(query, { $set: { isRead: true } });
+        res.status(200).json({ message: 'Messages marked as read' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error marking messages as read', error: error.message });
+    }
+});
+
+// Admin/Customer: Send a message
+app.post('/api/chats/:targetId', authenticateToken, async (req, res) => {
+    try {
+        const { text } = req.body;
+        const senderId = req.user.id;
+        const targetId = req.params.targetId;
+
+        if (!text || text.trim().length === 0) return res.status(400).json({ message: 'Message text is required' });
+        
+        let actualTargetId = targetId;
+
+        // If a customer is sending a message to 'admin', find the primary admin
+        if (targetId === 'admin') {
+            const primaryAdmin = await User.findOne({ role: 'admin' });
+            if (!primaryAdmin) return res.status(404).json({ message: 'No admin available' });
+            actualTargetId = primaryAdmin._id;
+        } else if (!mongoose.Types.ObjectId.isValid(targetId)) {
+            return res.status(400).json({ message: 'Invalid target ID' });
+        }
+
+        const newMessage = new ChatMessage({
+            sender: senderId,
+            receiver: actualTargetId,
+            text: text.trim()
+        });
+
+        await newMessage.save();
+        const populated = await newMessage.populate('sender', 'role');
+
+        res.status(201).json({
+            id: populated._id.toString(),
+            sender: populated.sender._id.toString(),
+            senderRole: populated.sender.role,
+            text: populated.text,
+            isRead: populated.isRead,
+            createdAt: populated.createdAt
+        });
+    } catch (error) {
+        res.status(500).json({ message: 'Error sending message', error: error.message });
+    }
+});
+
+// Admin: Delete a single message
+app.delete('/api/admin/messages/:messageId', authenticateToken, authenticateAdmin, async (req, res) => {
+    try {
+        const { messageId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ message: 'Invalid message ID' });
+
+        const result = await ChatMessage.findByIdAndDelete(messageId);
+        if (!result) return res.status(404).json({ message: 'Message not found' });
+
+        res.status(200).json({ message: 'Message deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error deleting message', error: error.message });
+    }
+});
+
+// Admin: Clear all messages with a specific user
+app.delete('/api/admin/chats/:userId', authenticateToken, authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user ID' });
+
+        const admins = await User.find({ role: 'admin' }).select('_id');
+        const adminIds = admins.map(a => a._id);
+
+        // Delete all messages where this user is either sender or receiver and the other end is ANY admin
+        await ChatMessage.deleteMany({
+            $or: [
+                { sender: userId, receiver: { $in: adminIds } },
+                { sender: { $in: adminIds }, receiver: userId }
+            ]
+        });
+
+        res.status(200).json({ message: 'Conversation cleared successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error clearing conversation', error: error.message });
     }
 });
 
