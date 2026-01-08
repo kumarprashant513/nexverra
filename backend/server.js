@@ -1,4 +1,3 @@
-
 // server.js
 import express from 'express';
 import cors from 'cors';
@@ -44,6 +43,7 @@ const productSchema = new mongoose.Schema({
   images: [{ type: String, required: true }],
   price: { type: Number, required: true },
   category: { type: String, required: true },
+  type: { type: String, enum: ['dashboard', 'website'], default: 'dashboard' },
   downloadableFile: {
     fileName: String,
     fileData: String, // Base64 encoded ZIP
@@ -430,11 +430,11 @@ app.get('/api/products', addUserToRequest, async (req, res) => {
 
 app.post('/api/products', authenticateToken, authenticateAdmin, async (req, res) => {
   try {
-    const { title, description, images, price, category, downloadableFile } = req.body;
+    const { title, description, images, price, category, type, downloadableFile } = req.body;
     if (!title || !description || !images || !price || !category) {
       return res.status(400).json({ message: 'Missing required product fields' });
     }
-    const newProduct = new Product({ title, description, images, price, category, downloadableFile });
+    const newProduct = new Product({ title, description, images, price, category, type, downloadableFile });
     const savedProduct = await newProduct.save();
     res.status(201).json(transformProduct(savedProduct));
   } catch (error) {
@@ -447,7 +447,8 @@ app.put('/api/products/:id', authenticateToken, authenticateAdmin, async (req, r
     const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ message: 'Invalid product ID' });
     
-    const { wishlisted, ...productData } = req.body;
+    // Stripping wishlisted and id/uuid to prevent immutable field errors
+    const { wishlisted, id: frontendId, _id: mongoId, ...productData } = req.body;
     
     // Explicitly handle setting downloadableFile to null to allow removal
     const updatePayload = { ...productData };
@@ -744,12 +745,13 @@ app.post('/api/contact', async (req, res) => {
         }
 
         const orderIdSuffix = order ? ` (Order ID: #${order.orderId})` : '';
+        const productImageLine = inquiry.productImage ? `\nProduct Image: ${inquiry.productImage}` : '';
         
         // Strictly left-aligned template for perfect parsing
         const inquirySummary = `[AUTO_NOTIFICATION:INQUIRY]
 Full Name: ${userInfo.fullName}
 Email Address: ${userInfo.email}
-Purpose of Contact: ${inquiry.plan}${orderIdSuffix}
+Purpose of Contact: ${inquiry.plan}${orderIdSuffix}${productImageLine}
 Phone Number: ${userInfo.phone || userInfo.contact || 'N/A'}
 Location / Address: ${userInfo.address || 'N/A'}
 Details / Requirements: ${inquiry.message}`;
@@ -1391,6 +1393,20 @@ app.delete('/api/admin/messages/:messageId', authenticateToken, authenticateAdmi
         res.status(200).json({ message: 'Message deleted successfully' });
     } catch (error) {
         res.status(500).json({ message: 'Error deleting message', error: error.message });
+    }
+});
+
+// Admin: Bulk delete messages
+app.delete('/api/admin/messages', authenticateToken, authenticateAdmin, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ message: 'Message IDs are required.' });
+        }
+        await ChatMessage.deleteMany({ _id: { $in: ids } });
+        res.status(200).json({ message: 'Messages deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error bulk deleting messages', error: error.message });
     }
 });
 
